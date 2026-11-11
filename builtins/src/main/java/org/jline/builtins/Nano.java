@@ -196,6 +196,8 @@ public class Nano implements Editor {
 
         boolean dirty;
 
+        boolean searchTimedOut;
+
         protected Buffer(String file) {
             this.file = file;
             this.syntaxHighlighter = SyntaxHighlighter.build(syntaxFiles, file, syntaxName, nanorcIgnoreErrors);
@@ -1063,6 +1065,7 @@ public class Nano implements Editor {
                 return false;
             }
             setMessage(null);
+            searchTimedOut = false;
             int cur = line;
             int dir = searchBackwards ? -1 : +1;
             int newPos = -1;
@@ -1081,7 +1084,7 @@ public class Nano implements Editor {
             }
             // Check other lines
             if (newPos < 0) {
-                while (true) {
+                while (!searchTimedOut) {
                     cur = (cur + dir + lines.size()) % lines.size();
                     if (cur == line) {
                         break;
@@ -1093,6 +1096,11 @@ public class Nano implements Editor {
                         break;
                     }
                 }
+            }
+            if (newPos < 0 && searchTimedOut) {
+                // The timeout has already been reported by doSearch()
+                matchedLength = 0;
+                return false;
             }
             if (newPos < 0) {
                 if (!curRes.isEmpty()) {
@@ -1113,6 +1121,8 @@ public class Nano implements Editor {
                 moveRight(newPos, true);
                 out = true;
             } else {
+                // No match: do not leave the length of a previous match behind
+                matchedLength = 0;
                 setMessage("\"" + searchTerm + "\" not found");
             }
             return out;
@@ -1122,11 +1132,18 @@ public class Nano implements Editor {
             Pattern pat = Pattern.compile(searchTerm,
                     (searchCaseSensitive ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE)
                             | (searchRegexp ? 0 : Pattern.LITERAL));
-            Matcher m = pat.matcher(text);
+            Matcher m = SafeRegex.matcher(pat, text);
             List<Integer> res = new ArrayList<>();
-            while (m.find()) {
-                res.add(m.start());
-                matchedLength = m.group(0).length();
+            try {
+                while (m.find()) {
+                    res.add(m.start());
+                    matchedLength = m.end() - m.start();
+                }
+            } catch (RegexTimeoutException e) {
+                // Catastrophic backtracking (ReDoS): report it and return
+                // whatever matches were found before the timeout
+                searchTimedOut = true;
+                setMessage("Search for \"" + searchTerm + "\" timed out");
             }
             return res;
         }

@@ -23,6 +23,7 @@ import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -1072,18 +1073,25 @@ public class Less {
         Pattern compiled = getPattern();
         Pattern dpCompiled = getPattern(true);
         if (compiled != null) {
-            for (int lineNumber = firstLineToDisplay + 1; ; lineNumber++) {
-                AttributedString line = getLine(lineNumber);
-                if (line == null) {
-                    break;
-                } else if (!toBeDisplayed(line, dpCompiled)) {
-                    continue;
-                } else if (compiled.matcher(line).find()) {
-                    display.clear();
-                    firstLineToDisplay = lineNumber;
-                    offsetInLine = 0;
-                    return;
+            try {
+                for (int lineNumber = firstLineToDisplay + 1; ; lineNumber++) {
+                    AttributedString line = getLine(lineNumber);
+                    if (line == null) {
+                        break;
+                    } else if (!toBeDisplayed(line, dpCompiled)) {
+                        continue;
+                    } else if (SafeRegex.matcher(compiled, line).find()) {
+                        display.clear();
+                        firstLineToDisplay = lineNumber;
+                        offsetInLine = 0;
+                        return;
+                    }
                 }
+            } catch (RegexTimeoutException e) {
+                // Catastrophic backtracking (ReDoS): give up the whole search
+                // instead of paying the timeout again on every remaining line
+                message = "Pattern search timed out";
+                return;
             }
         }
         if (spanFiles) {
@@ -1112,18 +1120,25 @@ public class Less {
         Pattern compiled = getPattern();
         Pattern dpCompiled = getPattern(true);
         if (compiled != null) {
-            for (int lineNumber = firstLineToDisplay - 1; lineNumber >= firstLineInMemory; lineNumber--) {
-                AttributedString line = getLine(lineNumber);
-                if (line == null) {
-                    break;
-                } else if (!toBeDisplayed(line, dpCompiled)) {
-                    continue;
-                } else if (compiled.matcher(line).find()) {
-                    display.clear();
-                    firstLineToDisplay = lineNumber;
-                    offsetInLine = 0;
-                    return;
+            try {
+                for (int lineNumber = firstLineToDisplay - 1; lineNumber >= firstLineInMemory; lineNumber--) {
+                    AttributedString line = getLine(lineNumber);
+                    if (line == null) {
+                        break;
+                    } else if (!toBeDisplayed(line, dpCompiled)) {
+                        continue;
+                    } else if (SafeRegex.matcher(compiled, line).find()) {
+                        display.clear();
+                        firstLineToDisplay = lineNumber;
+                        offsetInLine = 0;
+                        return;
+                    }
                 }
+            } catch (RegexTimeoutException e) {
+                // Catastrophic backtracking (ReDoS): give up the whole search
+                // instead of paying the timeout again on every remaining line
+                message = "Pattern search timed out";
+                return;
             }
         }
         if (spanFiles) {
@@ -1292,7 +1307,18 @@ public class Less {
     }
 
     private boolean toBeDisplayed(AttributedString curLine, Pattern dpCompiled) {
-        return curLine == null || dpCompiled == null || sourceIdx == 0 || dpCompiled.matcher(curLine).find();
+        if (curLine == null || dpCompiled == null || displayPattern == null || sourceIdx == 0) {
+            return true;
+        }
+        try {
+            return SafeRegex.matcher(dpCompiled, curLine).find();
+        } catch (RegexTimeoutException e) {
+            // Catastrophic backtracking (ReDoS): drop the display filter and show
+            // all lines, so a pathological pattern costs at most one timeout
+            displayPattern = null;
+            message = "Pattern filtering timed out";
+            return true;
+        }
     }
 
     synchronized boolean display(boolean oneScreen) throws IOException {
@@ -1326,7 +1352,17 @@ public class Less {
                     curLine = syntaxHighlighter.highlight(curLine);
                 }
                 if (compiled != null) {
-                    curLine = curLine.styleMatches(compiled, AttributedStyle.DEFAULT.inverse());
+                    try {
+                        curLine = styleMatches(curLine, compiled, AttributedStyle.DEFAULT.inverse());
+                    } catch (RegexTimeoutException e) {
+                        // Show this line unhighlighted and stop highlighting the rest
+                        // of the screen, so a pathological pattern costs at most one
+                        // timeout per redraw
+                        compiled = null;
+                        if (message == null) {
+                            message = "Pattern highlighting timed out";
+                        }
+                    }
                 }
             }
             AttributedString toDisplay;
@@ -1408,6 +1444,38 @@ public class Less {
             compiled = Pattern.compile("(" + _pattern + ")", insensitive ? Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE : 0);
         }
         return compiled;
+    }
+
+    /**
+     * Applies {@code style} to every match of {@code pattern} in {@code line}.
+     * <p>
+     * This is used instead of {@link AttributedString#styleMatches(Pattern, AttributedStyle)}
+     * so that the user supplied search pattern is matched through {@link SafeRegex}:
+     * a pattern subject to catastrophic backtracking (ReDoS) fails with a
+     * {@link RegexTimeoutException} instead of hanging the pager.
+     *
+     * @param line the line to highlight
+     * @param pattern the search pattern
+     * @param style the style to apply on the matching regions
+     * @return the highlighted line
+     * @throws RegexTimeoutException if matching exceeds the {@link SafeRegex} timeout
+     */
+    private static AttributedString styleMatches(AttributedString line, Pattern pattern, AttributedStyle style) {
+        Matcher matcher = SafeRegex.matcher(pattern, line);
+        if (!matcher.find()) {
+            return line;
+        }
+        AttributedStringBuilder sb = new AttributedStringBuilder(line.length());
+        int cur = 0;
+        do {
+            sb.append(line, cur, matcher.start());
+            sb.style(style);
+            sb.append(line, matcher.start(), matcher.end());
+            sb.style(AttributedStyle.DEFAULT);
+            cur = matcher.end();
+        } while (matcher.find());
+        sb.append(line, cur, line.length());
+        return sb.toAttributedString();
     }
 
     AttributedString getLine(int line) throws IOException {
